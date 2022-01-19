@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda Redshift ETL'
+Resources:
+  LambdaUpdateGlueTableRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            -
+              Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+      Path: /
+      Policies:
+          -
+            PolicyName: LambdaUpdateGlueTablePolicy
+            PolicyDocument :
+              Version: 2012-10-17
+              Statement:
+                -
+                  Effect: "Allow"
+                  Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - glue:UpdateTable
+                  - glue:GetTable*
+                  Resource: "*"
+  LambdaUpdateGlueTable:
+    DependsOn: LambdaUpdateGlueTableRole
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Update Op Column in Glue Tables
+      Handler: index.handler
+      Runtime: python3.7
+      Role: !GetAtt 'LambdaUpdateGlueTableRole.Arn'
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import time
+
+          def handler(event, context):
+              print("event: {}".format(event))
+
+              start_time = time.time()
+              glue_database_name = event['Input'].get('glue_database_name')
+
+              try:
+                  client_glue = boto3.client('glue')
+                  glue_tables_list = get_glue_tables(client_glue, glue_database_name)
+                  print(glue_tables_list)
+                  for tablename in glue_tables_list:
+                      add_op_column_to_glue_table(client_glue, glue_database_name, tablename)
+                  end_time = time.time()
+                  print("start time:                    {}".format(time.ctime(start_time)))
+                  print("end time:                      {}.".format(time.ctime(end_time)))
+                  print("total time taken in minutes:   {}".format(round((end_time - start_time) / 60, 2)))
+
+              except Exception as e:
+                  print(e)
+                  raise
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('glue databases updated')
+              }
+
+          def get_glue_tables(client_glue, database_name):
+              next_token = ""
+              tables = []
+
+              while True:
+                  response = client_glue.get_tables(
+                      DatabaseName=database_name,
+                      NextToken=next_token
+                  )
+
+                  for table in response.get('TableList'):
+                      tables.append(table.get('Name'))
+                  next_token = response.get('NextToken')
+
+                  if next_token is None:
+                      break
+
+              return tables
+
+
+          def add_op_column_to_glue_table(client_glue, database_name, table_name):
+              response = client_glue.get_table(
+                  DatabaseName=database_name,
+                  Name=table_name)
+              old_table = response['Table']
+
+              field_names = [
+                  "Name",
+                  "Description",
+                  "Owner",
+                  "LastAccessTime",
+                  "LastAnalyzedTime",
+                  "Retention",
+                  "StorageDescriptor",
+                  "PartitionKeys",
+                  "ViewOriginalText",
+                  "ViewExpandedText",
+                  "TableType",
+                  "Parameters"
+              ]
+              new_table = dict()
+              for key in field_names:
+                  if key in old_table:
+                      new_table[key] = old_table[key]
+
+              op_exists = False
+              for col in new_table['StorageDescriptor']['Columns']:
+                  if col['Name'] == 'op':
+                      op_exists = True
+                      break
+
+              if not op_exists:
+                  print("create op column")
+                  (new_table['StorageDescriptor']['Columns']).append({'Name': 'op', 'Type': 'string'})
+                  response = client_glue.update_table(DatabaseName=database_name, TableInput=new_table)
+                  print("added op column to table: {}".format(table_name))
+              else:
+                  print("op column already exists in table: {}".format(table_name))
+              return response
+
+          if __name__ == "__main__":
+              event = {
+                  'Input': {
+                      'glue_database_name': 'tg'
+                  }
+              }
+              context = ""
+              handler(event, context)
